@@ -131,9 +131,13 @@ FUNC(Encode) {
 	
 	unsigned char *result = (unsigned char*) malloc(dest_len);
 	size_t len = encode(line_size, &col, (const unsigned char*)node::Buffer::Data(args[0]), result, arg_len, true);
-	result = (unsigned char*)realloc(result, len);
-	MARK_EXT_MEM(len);
-	RETURN_VAL( NEW_BUFFER((char*)result, len, free_buffer, (void*)len) );
+  Local<Object> nodeBuffer = NEW_BUFFER(len);
+  if (len > 0) {
+    memcpy(node::Buffer::Data(nodeBuffer), result, len);
+  }
+  free(result);
+
+  RETURN_VAL(nodeBuffer);
 }
 
 FUNC(EncodeTo) {
@@ -225,9 +229,12 @@ FUNC(EncodeIncr) {
 	
 	SET_OBJ(ret, "written", Integer::New(ISOLATE len));
 	if(allocResult) {
-		result = (unsigned char*)realloc(result, len);
-		SET_OBJ(ret, "output", NEW_BUFFER((char*)result, len, free_buffer, (void*)len));
-		MARK_EXT_MEM(len);
+    Local<Object> nodeBuffer = NEW_BUFFER(len);
+    if (len > 0) {
+      memcpy(node::Buffer::Data(nodeBuffer), result, len);
+    }
+    free(result);
+    SET_OBJ(ret, "output", nodeBuffer);
 	}
 	SET_OBJ(ret, "col", Integer::New(ISOLATE col));
 	RETURN_VAL( ret );
@@ -249,9 +256,13 @@ FUNC(Decode) {
 	
 	unsigned char *result = (unsigned char*) malloc(arg_len);
 	size_t len = decode(isRaw, (const unsigned char*)node::Buffer::Data(args[0]), result, arg_len, NULL);
-	result = (unsigned char*)realloc(result, len);
-	MARK_EXT_MEM(len);
-	RETURN_VAL( NEW_BUFFER((char*)result, len, free_buffer, (void*)len) );
+  Local<Object> nodeBuffer = NEW_BUFFER(len);
+  if (len > 0) {
+    memcpy(node::Buffer::Data(nodeBuffer), result, len);
+  }
+  free(result);
+
+  RETURN_VAL(nodeBuffer);
 }
 
 FUNC(DecodeTo) {
@@ -323,8 +334,12 @@ FUNC(DecodeIncr) {
 	SET_OBJ(ret, "read", Integer::New(ISOLATE sp - src));
 	SET_OBJ(ret, "written", Integer::New(ISOLATE len));
 	if(allocResult) {
-		SET_OBJ(ret, "output", NEW_BUFFER((char*)result, len, free_buffer, (void*)len));
-		MARK_EXT_MEM(len);
+    Local<Object> nodeBuffer = NEW_BUFFER(len);
+    if (len > 0) {
+      memcpy(node::Buffer::Data(nodeBuffer), result, len);
+    }
+    free(result);
+    SET_OBJ(ret, "output", nodeBuffer);
 	}
 	SET_OBJ(ret, "ended", Integer::New(ISOLATE (int)ended));
 	SET_OBJ(ret, "state", Integer::New(ISOLATE state));
