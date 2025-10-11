@@ -20,11 +20,11 @@
             }
           }],
           ['target_arch=="arm64"', {
-            "cflags": ["-march=apple-m1"],
-            "cxxflags": ["-march=apple-m1"],
+            "cflags": [],
+            "cxxflags": [],
             "xcode_settings": {
-              "OTHER_CFLAGS": ["-march=apple-m1"],
-              "OTHER_CXXFLAGS": ["-march=apple-m1"],
+              "OTHER_CFLAGS": [],
+              "OTHER_CXXFLAGS": [],
             }
           }]
         ]
