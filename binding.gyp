@@ -9,7 +9,27 @@
       ['target_arch=="ia32"', {
         "msvs_settings": {"VCCLCompilerTool": {"EnableEnhancedInstructionSet": "2"}}
       }],
-      ['OS!="win" and enable_native_tuning!=0', {
+      ['OS=="mac" and enable_native_tuning!=0', {
+        "conditions": [
+          ['target_arch=="x64"', {
+            "cflags": ["-march=haswell"],
+            "cxxflags": ["-march=haswell"],
+            "xcode_settings": {
+              "OTHER_CFLAGS": ["-march=haswell"],
+              "OTHER_CXXFLAGS": ["-march=haswell"],
+            }
+          }],
+          ['target_arch=="arm64"', {
+            "cflags": ["-march=apple-m1"],
+            "cxxflags": ["-march=apple-m1"],
+            "xcode_settings": {
+              "OTHER_CFLAGS": ["-march=apple-m1"],
+              "OTHER_CXXFLAGS": ["-march=apple-m1"],
+            }
+          }]
+        ]
+      }],
+      ['OS!="win" and OS!="mac" and enable_native_tuning!=0', {
         "variables": {
           "supports_native%": "<!(<!(echo ${CXX_target:-${CXX:-c++}}) -MM -E src/common.h -march=native 2>/dev/null || true)"
         },

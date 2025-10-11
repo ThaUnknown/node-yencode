@@ -1,6 +1,6 @@
 {
   "name": "@thaunknown/yencode",
-  "version": "1.2.4",
+  "version": "1.2.6",
   "description": "SIMD accelerated yEnc encoder/decoder and CRC32 calculator",
   "keywords": [
     "yenc",
@@ -20,7 +20,8 @@
   "scripts": {
     "install": "node-gyp-build",
     "prebuild": "prebuildify --napi --strip",
-    "prebuild-ia32": "prebuildify --napi --strip --arch=ia32"
+    "prebuild-ia32": "prebuildify --napi --strip --arch=ia32",
+    "prebuild-all": "prebuildify --napi --strip --all"
   },
   "gypfile": true,
   "type": "commonjs",
