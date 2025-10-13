@@ -1,6 +1,6 @@
 {
-  "name": "yencode",
-  "version": "1.2.3",
+  "name": "@thaunknown/yencode",
+  "version": "1.3.0",
   "description": "SIMD accelerated yEnc encoder/decoder and CRC32 calculator",
   "keywords": [
     "yenc",
@@ -11,7 +11,7 @@
   "author": "Anime Tosho",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/animetosho/node-yencode.git"
+    "url": "git+https://github.com/thaunknown/node-yencode.git"
   },
   "main": "index.js",
   "engines": {
@@ -23,7 +23,6 @@
   "gypfile": true,
   "type": "commonjs",
   "bugs": {
-    "url": "https://github.com/animetosho/node-yencode/issues"
-  },
-  "homepage": "https://animetosho.org/app/node-yencode"
+    "url": "https://github.com/thaunknown/node-yencode/issues"
+  }
 }
