@@ -9,9 +9,9 @@
       ['target_arch=="ia32"', {
         "msvs_settings": {"VCCLCompilerTool": {"EnableEnhancedInstructionSet": "2"}}
       }],
-      ['OS!="win" and enable_native_tuning!=0', {
+      ['OS!="win" and enable_native_tuning!=0 and target_arch==host_arch', {
         "variables": {
-          "supports_native%": "<!(<!(echo ${CXX_target:-${CXX:-c++}}) -w -c -x c++ src/common.h -march=native -o /dev/null 2>/dev/null && echo success || true)"
+          "supports_native%": "<!(<!(echo ${CXX_target:-${CXX:-c++}}) -MM -E src/common.h -march=native 2>/dev/null || true)"
         },
         "conditions": [
           ['supports_native!=""', {
@@ -20,7 +20,8 @@
             "xcode_settings": {
               "OTHER_CFLAGS": ["-march=native"],
               "OTHER_CXXFLAGS": ["-march=native"],
-            }
+            },
+            "defines": ["YENC_BUILD_NATIVE=1"]
           }]
         ]
       }],
@@ -44,9 +45,6 @@
       }],
       ['disable_crcutil!=0', {
         "defines": ["YENC_DISABLE_CRCUTIL=1"]
-      }],
-      ['OS!="win" and enable_native_tuning!=0', {
-        "defines": ["YENC_BUILD_NATIVE=1"]
       }],
       ['OS!="win"', {
         "variables": {
