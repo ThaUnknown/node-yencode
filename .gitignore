@@ -4,6 +4,7 @@ npm-lock.json
 yarn.lock
 build
 prebuilds
+index.js
 index.d.ts
 index.js.map
 y.d.cts
