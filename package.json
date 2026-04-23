@@ -1,6 +1,6 @@
 {
   "name": "@thaunknown/yencode",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "type": "module",
   "description": "SIMD accelerated yEnc encoder/decoder and CRC32 calculator",
   "keywords": [
@@ -13,7 +13,8 @@
     "index.*",
     "src/**/*",
     "prebuilds/**/*",
-    "crcutil-1.0/**/*"
+    "crcutil-1.0/**/*",
+    "binding.gyp"
   ],
   "license": "CC0-1.0",
   "author": "Anime Tosho",
