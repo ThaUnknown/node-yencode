@@ -1,0 +1,18 @@
+{
+  "extends": "eslint-config-standard-universal/tsconfig.json",
+  "compilerOptions": {
+    "types": [
+      "node"
+    ],
+    "outDir": "./"
+  },
+  "include": [
+    "index.ts"
+  ],
+  "exclude": [
+    "y.cjs"
+  ],
+  "files": [
+    "index.ts"
+  ]
+}
