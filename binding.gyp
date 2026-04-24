@@ -59,7 +59,7 @@
       }]
     ],
     "cflags": ["-Wno-unused-function"],
-    "cxxflags": ["-Wno-unused-function", "-std=c++03"],
+    "cxxflags": ["-Wno-unused-function", "-std=c++17"],
     "xcode_settings": {
       "OTHER_CFLAGS": ["-Wno-unused-function"],
       "OTHER_CXXFLAGS": ["-Wno-unused-function"]

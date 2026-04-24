@@ -1,31 +1,14 @@
-
-#include <node.h>
-#include <node_buffer.h>
-#include <node_version.h>
-#include <v8.h>
+#include <node_api.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <mutex>
 
 #include "encoder.h"
 #include "decoder.h"
 #include "crc.h"
 
-using namespace v8;
 using namespace RapidYenc;
-
-#ifdef V8_ENABLE_SANDBOX
-// V8 Memory Cage is enabled - no external buffers allowed
-# define YENC_NO_EXTERNAL_BUFFER 1
-#endif
-
-static void free_buffer(char* data, void* _size) {
-#if !NODE_VERSION_AT_LEAST(0, 11, 0)
-	int size = (int)(size_t)_size;
-	V8::AdjustAmountOfExternalAllocatedMemory(-size);
-#endif
-	//Isolate::GetCurrent()->AdjustAmountOfExternalAllocatedMemory(-size);
-	free(data);
-}
 
 // TODO: encode should return col num for incremental processing
 //       line limit + return input consumed
@@ -39,482 +22,676 @@ static inline size_t YENC_MAX_SIZE(size_t len, size_t line_size) {
 #else
 		+ 32 /* allocation for XMM overflowing */
 #endif
-	;
+		;
 	/* add newlines, considering the possibility of all chars escaped */
-	if(line_size == 128) // optimize common case
+	if (line_size == 128) // optimize common case
 		return ret + 2 * (len >> 6);
-	return ret + 2 * ((len*2) / line_size);
+	return ret + 2 * ((len * 2) / line_size);
 }
 
+static void free_buffer(napi_env, void* data, void*) {
+	free(data);
+}
 
+static void init_all() {
+	static std::once_flag init_flag;
+	std::call_once(init_flag, []() {
+		encoder_init();
+		decoder_init();
+		crc32_init();
+	});
+}
 
-#if NODE_VERSION_AT_LEAST(0, 11, 0)
-// for node 0.12.x
-# define FUNC(name) static void name(const FunctionCallbackInfo<Value>& args)
-# define FUNC_START \
-	Isolate* isolate = args.GetIsolate(); \
-	HandleScope scope(isolate)
+static napi_value ThrowTypeError(napi_env env, const char* msg) {
+	napi_throw_type_error(env, nullptr, msg);
+	return nullptr;
+}
 
-# if NODE_VERSION_AT_LEAST(8, 0, 0)
-#  define NEW_STRING(s) String::NewFromOneByte(isolate, (const uint8_t*)(s), NewStringType::kNormal).ToLocalChecked()
-#  define RETURN_ERROR(e) { isolate->ThrowException(Exception::Error(String::NewFromOneByte(isolate, (const uint8_t*)(e), NewStringType::kNormal).ToLocalChecked())); return; }
-#  define ARG_TO_INT(a) (a).As<Integer>()->Value()
-#  define ARG_TO_BOOL(a) (a).As<Boolean>()->Value()
-# else
-#  define NEW_STRING(s) String::NewFromUtf8(isolate, s)
-#  define RETURN_ERROR(e) { isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, e))); return; }
-#  define ARG_TO_INT(a) (a)->ToInteger()->Value()
-#  define ARG_TO_BOOL(a) (a)->ToBoolean()->Value()
-# endif
-# define NEW_OBJECT Object::New(isolate)
-# if NODE_VERSION_AT_LEAST(3, 0, 0) // iojs3
-#  define NEW_BUFFER(...) node::Buffer::New(ISOLATE __VA_ARGS__).ToLocalChecked()
-# else
-#  define NEW_BUFFER(...) node::Buffer::New(ISOLATE __VA_ARGS__)
-# endif
+static napi_value ThrowRangeError(napi_env env, const char* msg) {
+	napi_throw_range_error(env, nullptr, msg);
+	return nullptr;
+}
 
-# define RETURN_VAL(v) { args.GetReturnValue().Set(v); return; }
-# define RETURN_UNDEF return
-# define ISOLATE isolate,
-//# define MARK_EXT_MEM isolate->AdjustAmountOfExternalAllocatedMemory
-# define MARK_EXT_MEM(x)
+static napi_value ThrowError(napi_env env, const char* msg) {
+	napi_throw_error(env, nullptr, msg);
+	return nullptr;
+}
 
-#else
-// for node 0.10.x
-#define FUNC(name) static Handle<Value> name(const Arguments& args)
-#define FUNC_START HandleScope scope
-#define NEW_STRING String::New
-#define NEW_OBJECT Object::New()
-#define NEW_BUFFER(...) Local<Object>::New(node::Buffer::New(ISOLATE __VA_ARGS__)->handle_)
-#define ARG_TO_INT(a) (a)->ToInteger()->Value()
-#define ARG_TO_BOOL(a) (a)->ToBoolean()->Value()
+static napi_value Undefined(napi_env env) {
+	napi_value value;
+	napi_get_undefined(env, &value);
+	return value;
+}
 
-#define RETURN_ERROR(e) \
-	return ThrowException(Exception::Error( \
-		String::New(e)) \
-	)
-#define RETURN_VAL(v) return scope.Close(v)
-#define RETURN_UNDEF RETURN_VAL( Undefined() )
-#define ISOLATE
-#define MARK_EXT_MEM V8::AdjustAmountOfExternalAllocatedMemory
-#endif
+static bool GetBufferInfo(napi_env env, napi_value value, const uint8_t** data, size_t* length) {
+	bool is_buffer = false;
+	if (napi_is_buffer(env, value, &is_buffer) != napi_ok || !is_buffer)
+		return false;
+	void* ptr = nullptr;
+	if (napi_get_buffer_info(env, value, &ptr, length) != napi_ok)
+		return false;
+	*data = static_cast<const uint8_t*>(ptr);
+	return true;
+}
 
-#if NODE_VERSION_AT_LEAST(12, 0, 0)
-# define SET_OBJ(obj, key, val) (obj)->Set(isolate->GetCurrentContext(), NEW_STRING(key), val).Check()
-#else
-# define SET_OBJ(obj, key, val) (obj)->Set(NEW_STRING(key), val)
-#endif
+static bool GetMutableBufferInfo(napi_env env, napi_value value, unsigned char** data, size_t* length) {
+	bool is_buffer = false;
+	if (napi_is_buffer(env, value, &is_buffer) != napi_ok || !is_buffer)
+		return false;
+	void* ptr = nullptr;
+	if (napi_get_buffer_info(env, value, &ptr, length) != napi_ok)
+		return false;
+	*data = static_cast<unsigned char*>(ptr);
+	return true;
+}
 
+static bool GetInt32(napi_env env, napi_value value, int32_t* out) {
+	return napi_get_value_int32(env, value, out) == napi_ok;
+}
 
-#ifndef YENC_NO_EXTERNAL_BUFFER
-// encode(str, line_size, col)
-FUNC(Encode) {
-	FUNC_START;
-	
-	if (args.Length() == 0 || !node::Buffer::HasInstance(args[0]))
-		RETURN_ERROR("You must supply a Buffer");
-	
-	size_t arg_len = node::Buffer::Length(args[0]);
-	if (arg_len == 0)
-		RETURN_VAL(NEW_BUFFER(0));
-	
-	int line_size = 128, col = 0;
-	if (args.Length() >= 2) {
-		line_size = (int)ARG_TO_INT(args[1]);
-		if (line_size == 0) line_size = 128; // allow this case
+static bool GetBool(napi_env env, napi_value value, bool* out) {
+	return napi_get_value_bool(env, value, out) == napi_ok;
+}
+
+static bool SetNamedProperty(napi_env env, napi_value object, const char* name, napi_value value) {
+	return napi_set_named_property(env, object, name, value) == napi_ok;
+}
+
+static bool CreateNumber(napi_env env, double value, napi_value* out) {
+	return napi_create_double(env, value, out) == napi_ok;
+}
+
+static bool CreateInt32(napi_env env, int32_t value, napi_value* out) {
+	return napi_create_int32(env, value, out) == napi_ok;
+}
+
+static napi_value CreateBuffer(napi_env env, size_t length, unsigned char** data) {
+	napi_value buffer;
+	void* ptr = nullptr;
+	if (napi_create_buffer(env, length, &ptr, &buffer) != napi_ok)
+		return ThrowError(env, "Failed to allocate buffer");
+	if (data)
+		*data = static_cast<unsigned char*>(ptr);
+	return buffer;
+}
+
+static napi_value CreateExternalBuffer(napi_env env, unsigned char* data, size_t length) {
+	napi_value buffer;
+	if (napi_create_external_buffer(env, length, data, free_buffer, nullptr, &buffer) != napi_ok) {
+		free(data);
+		return ThrowError(env, "Failed to create external buffer");
+	}
+	return buffer;
+}
+
+static napi_value PackCrc32(napi_env env, uint32_t crc) {
+	unsigned char* data = nullptr;
+	napi_value buffer = CreateBuffer(env, 4, &data);
+	if (buffer == nullptr)
+		return nullptr;
+	data[0] = static_cast<unsigned char>((crc >> 24) & 0xFF);
+	data[1] = static_cast<unsigned char>((crc >> 16) & 0xFF);
+	data[2] = static_cast<unsigned char>((crc >> 8) & 0xFF);
+	data[3] = static_cast<unsigned char>(crc & 0xFF);
+	return buffer;
+}
+
+static inline uint32_t ReadCrc32(const uint8_t* arr) {
+	return (static_cast<uint_fast32_t>(arr[0]) << 24)
+		| (static_cast<uint_fast32_t>(arr[1]) << 16)
+		| (static_cast<uint_fast32_t>(arr[2]) << 8)
+		| static_cast<uint_fast32_t>(arr[3]);
+}
+
+static napi_value Encode(napi_env env, napi_callback_info info) {
+	init_all();
+
+	size_t argc = 3;
+	napi_value args[3];
+	if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok)
+		return ThrowError(env, "Failed to read arguments");
+	if (argc == 0)
+		return ThrowTypeError(env, "You must supply a Buffer");
+
+	const uint8_t* input = nullptr;
+	size_t input_len = 0;
+	if (!GetBufferInfo(env, args[0], &input, &input_len))
+		return ThrowTypeError(env, "You must supply a Buffer");
+	if (input_len == 0)
+		return CreateBuffer(env, 0, nullptr);
+
+	int line_size = 128;
+	int col = 0;
+	if (argc >= 2) {
+		int32_t parsed = 0;
+		if (!GetInt32(env, args[1], &parsed))
+			return ThrowTypeError(env, "Line size must be a number");
+		line_size = static_cast<int>(parsed);
+		if (line_size == 0)
+			line_size = 128;
 		if (line_size < 0)
-			RETURN_ERROR("Line size must be at least 1 byte");
-		if (args.Length() >= 3) {
-			col = (int)ARG_TO_INT(args[2]);
+			return ThrowRangeError(env, "Line size must be at least 1 byte");
+		if (argc >= 3) {
+			if (!GetInt32(env, args[2], &parsed))
+				return ThrowTypeError(env, "Column offset must be a number");
+			col = static_cast<int>(parsed);
 			if (col > line_size || col < 0)
-				RETURN_ERROR("Column offset cannot exceed the line size and cannot be negative");
-			if (col == line_size) col = 0; // allow this case
+				return ThrowRangeError(env, "Column offset cannot exceed the line size and cannot be negative");
+			if (col == line_size)
+				col = 0;
 		}
 	}
-	
-	// allocate enough memory to handle worst case requirements
-	size_t dest_len = YENC_MAX_SIZE(arg_len, line_size);
-	
-	unsigned char *result = (unsigned char*) malloc(dest_len);
-	size_t len = encode(line_size, &col, (const unsigned char*)node::Buffer::Data(args[0]), result, arg_len, true);
-	result = (unsigned char*)realloc(result, len);
-	MARK_EXT_MEM(len);
-	RETURN_VAL( NEW_BUFFER((char*)result, len, free_buffer, (void*)len) );
-}
-#endif
 
-FUNC(EncodeTo) {
-	FUNC_START;
-	
-	if (args.Length() < 2 || !node::Buffer::HasInstance(args[0]) || !node::Buffer::HasInstance(args[1]))
-		RETURN_ERROR("You must supply two Buffers");
-	
-	size_t arg_len = node::Buffer::Length(args[0]);
-	if (arg_len == 0)
-		RETURN_VAL(Integer::New(ISOLATE 0));
-	
-	int line_size = 128, col = 0;
-	if (args.Length() >= 3) {
-		line_size = (int)ARG_TO_INT(args[2]);
-		if (line_size == 0) line_size = 128; // allow this case
+	size_t dest_len = YENC_MAX_SIZE(input_len, static_cast<size_t>(line_size));
+	unsigned char* result = static_cast<unsigned char*>(malloc(dest_len));
+	if (!result)
+		return ThrowError(env, "Out of memory");
+
+	size_t len = encode(line_size, &col, input, result, input_len, true);
+	unsigned char* shrunk = static_cast<unsigned char*>(realloc(result, len));
+	if (shrunk != nullptr)
+		result = shrunk;
+	else if (len != 0) {
+		unsigned char* exact = static_cast<unsigned char*>(malloc(len));
+		if (!exact) {
+			free(result);
+			return ThrowError(env, "Out of memory");
+		}
+		memcpy(exact, result, len);
+		free(result);
+		result = exact;
+	}
+
+	return CreateExternalBuffer(env, result, len);
+}
+
+static napi_value EncodeTo(napi_env env, napi_callback_info info) {
+	init_all();
+
+	size_t argc = 4;
+	napi_value args[4];
+	if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok)
+		return ThrowError(env, "Failed to read arguments");
+	if (argc < 2)
+		return ThrowTypeError(env, "You must supply two Buffers");
+
+	const uint8_t* input = nullptr;
+	const uint8_t* output = nullptr;
+	size_t input_len = 0;
+	size_t output_len = 0;
+	if (!GetBufferInfo(env, args[0], &input, &input_len) || !GetBufferInfo(env, args[1], &output, &output_len))
+		return ThrowTypeError(env, "You must supply two Buffers");
+	if (input_len == 0) {
+		napi_value zero;
+		if (!CreateNumber(env, 0, &zero))
+			return ThrowError(env, "Failed to create return value");
+		return zero;
+	}
+
+	int line_size = 128;
+	int col = 0;
+	if (argc >= 3) {
+		int32_t parsed = 0;
+		if (!GetInt32(env, args[2], &parsed))
+			return ThrowTypeError(env, "Line size must be a number");
+		line_size = static_cast<int>(parsed);
+		if (line_size == 0)
+			line_size = 128;
 		if (line_size < 0)
-			RETURN_ERROR("Line size must be at least 1 byte");
-		if (args.Length() >= 4) {
-			col = (int)ARG_TO_INT(args[3]);
+			return ThrowRangeError(env, "Line size must be at least 1 byte");
+		if (argc >= 4) {
+			if (!GetInt32(env, args[3], &parsed))
+				return ThrowTypeError(env, "Column offset must be a number");
+			col = static_cast<int>(parsed);
 			if (col > line_size || col < 0)
-				RETURN_ERROR("Column offset cannot exceed the line size and cannot be negative");
-			if (col == line_size) col = 0; // allow this case
+				return ThrowRangeError(env, "Column offset cannot exceed the line size and cannot be negative");
+			if (col == line_size)
+				col = 0;
 		}
 	}
-	
-	// check that destination buffer has enough space
-	size_t dest_len = YENC_MAX_SIZE(arg_len, line_size);
-	if(node::Buffer::Length(args[1]) < dest_len)
-		RETURN_ERROR("Destination buffer does not have enough space (use `maxSize` to compute required space)");
-	
-	size_t len = encode(line_size, &col, (const unsigned char*)node::Buffer::Data(args[0]), (unsigned char*)node::Buffer::Data(args[1]), arg_len, true);
-	RETURN_VAL( Integer::New(ISOLATE len) );
+
+	size_t dest_len = YENC_MAX_SIZE(input_len, static_cast<size_t>(line_size));
+	if (output_len < dest_len)
+		return ThrowError(env, "Destination buffer does not have enough space (use `maxSize` to compute required space)");
+
+	size_t len = encode(line_size, &col, input, const_cast<unsigned char*>(output), input_len, true);
+	napi_value result;
+	if (!CreateNumber(env, static_cast<double>(len), &result))
+		return ThrowError(env, "Failed to create return value");
+	return result;
 }
 
-FUNC(EncodeIncr) {
-	FUNC_START;
-	
-	if (args.Length() == 0 || !node::Buffer::HasInstance(args[0]))
-		RETURN_ERROR("You must supply a Buffer");
-	
-	int line_size = 128, col = 0;
-	bool allocResult = true;
-	unsigned char* result;
-	size_t arg_len = node::Buffer::Length(args[0]);
-	if(args.Length() > 1) {
-		int argp = 1;
-		if(node::Buffer::HasInstance(args[1])) {
-			// grab destination
-			allocResult = false;
-			// check that destination buffer has enough space
-			size_t dest_len = YENC_MAX_SIZE(arg_len, line_size);
-			if(node::Buffer::Length(args[1]) < dest_len)
-				RETURN_ERROR("Destination buffer does not have enough space (use `maxSize` to compute required space)");
-			result = (unsigned char*)node::Buffer::Data(args[1]);
-			argp++;
+static napi_value EncodeIncr(napi_env env, napi_callback_info info) {
+	init_all();
+
+	size_t argc = 4;
+	napi_value args[4];
+	if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok)
+		return ThrowError(env, "Failed to read arguments");
+	if (argc == 0)
+		return ThrowTypeError(env, "You must supply a Buffer");
+
+	const uint8_t* input = nullptr;
+	size_t input_len = 0;
+	if (!GetBufferInfo(env, args[0], &input, &input_len))
+		return ThrowTypeError(env, "You must supply a Buffer");
+
+	int line_size = 128;
+	int col = 0;
+	int argp = 1;
+	unsigned char* result = nullptr;
+	size_t output_len = 0;
+	bool alloc_result = true;
+	if (argc > 1) {
+		bool is_buffer = false;
+		if (napi_is_buffer(env, args[1], &is_buffer) == napi_ok && is_buffer) {
+			if (!GetMutableBufferInfo(env, args[1], &result, &output_len))
+				return ThrowError(env, "Failed to read destination buffer");
+			alloc_result = false;
+			argp = 2;
 		}
-		if (args.Length() > argp) {
-			line_size = (int)ARG_TO_INT(args[argp]);
-			if (line_size == 0) line_size = 128; // allow this case
+		if (argc > static_cast<size_t>(argp)) {
+			int32_t parsed = 0;
+			if (!GetInt32(env, args[argp], &parsed))
+				return ThrowTypeError(env, "Line size must be a number");
+			line_size = static_cast<int>(parsed);
+			if (line_size == 0)
+				line_size = 128;
 			if (line_size < 0)
-				RETURN_ERROR("Line size must be at least 1 byte");
-			argp++;
-			if (args.Length() > argp) {
-				col = (int)ARG_TO_INT(args[argp]);
+				return ThrowRangeError(env, "Line size must be at least 1 byte");
+			++argp;
+			if (argc > static_cast<size_t>(argp)) {
+				if (!GetInt32(env, args[argp], &parsed))
+					return ThrowTypeError(env, "Column offset must be a number");
+				col = static_cast<int>(parsed);
 				if (col > line_size || col < 0)
-					RETURN_ERROR("Column offset cannot exceed the line size and cannot be negative");
-				if (col == line_size) col = 0; // allow this case
+					return ThrowRangeError(env, "Column offset cannot exceed the line size and cannot be negative");
+				if (col == line_size)
+					col = 0;
 			}
 		}
 	}
-#ifdef YENC_NO_EXTERNAL_BUFFER
-	if(allocResult) RETURN_ERROR("Destination buffer must be supplied as buffer allocation isn't enabled in this build");
-#endif
-	
-	Local<Object> ret = NEW_OBJECT;
-	
-	if (arg_len == 0) {
-		SET_OBJ(ret, "written", Integer::New(ISOLATE 0));
-		// TODO: set 'output'?
-		SET_OBJ(ret, "col", Integer::New(ISOLATE col));
-		RETURN_VAL( ret );
+
+	napi_value ret;
+	if (napi_create_object(env, &ret) != napi_ok)
+		return ThrowError(env, "Failed to create return value");
+
+	if (input_len == 0) {
+		napi_value written;
+		napi_value col_value;
+		if (!CreateNumber(env, 0, &written) || !CreateNumber(env, static_cast<double>(col), &col_value))
+			return ThrowError(env, "Failed to create return value");
+		if (!SetNamedProperty(env, ret, "written", written) || !SetNamedProperty(env, ret, "col", col_value))
+			return ThrowError(env, "Failed to set return value");
+		return ret;
 	}
-	
-#ifndef YENC_NO_EXTERNAL_BUFFER
-	if(allocResult) {
-		// allocate enough memory to handle worst case requirements
-		size_t dest_len = YENC_MAX_SIZE(arg_len, line_size);
-		result = (unsigned char*) malloc(dest_len);
+
+	size_t dest_len = YENC_MAX_SIZE(input_len, static_cast<size_t>(line_size));
+	if (alloc_result) {
+		result = static_cast<unsigned char*>(malloc(dest_len));
+		if (!result)
+			return ThrowError(env, "Out of memory");
+	} else if (output_len < dest_len) {
+		return ThrowError(env, "Destination buffer does not have enough space (use `maxSize` to compute required space)");
 	}
-#endif
-	
-	size_t len = encode(line_size, &col, (const unsigned char*)node::Buffer::Data(args[0]), result, arg_len, false);
-	
-	SET_OBJ(ret, "written", Integer::New(ISOLATE len));
-#ifndef YENC_NO_EXTERNAL_BUFFER
-	if(allocResult) {
-		result = (unsigned char*)realloc(result, len);
-		SET_OBJ(ret, "output", NEW_BUFFER((char*)result, len, free_buffer, (void*)len));
-		MARK_EXT_MEM(len);
+
+	size_t len = encode(line_size, &col, input, result, input_len, false);
+	napi_value written;
+	napi_value col_value;
+	if (!CreateNumber(env, static_cast<double>(len), &written) || !CreateNumber(env, static_cast<double>(col), &col_value))
+		return ThrowError(env, "Failed to create return value");
+	if (!SetNamedProperty(env, ret, "written", written) || !SetNamedProperty(env, ret, "col", col_value))
+		return ThrowError(env, "Failed to set return value");
+
+	if (alloc_result) {
+		unsigned char* shrunk = static_cast<unsigned char*>(realloc(result, len));
+		if (shrunk != nullptr)
+			result = shrunk;
+		else if (len != 0) {
+			unsigned char* exact = static_cast<unsigned char*>(malloc(len));
+			if (!exact) {
+				free(result);
+				return ThrowError(env, "Out of memory");
+			}
+			memcpy(exact, result, len);
+			free(result);
+			result = exact;
+		}
+		napi_value output = CreateExternalBuffer(env, result, len);
+		if (output == nullptr)
+			return nullptr;
+		if (!SetNamedProperty(env, ret, "output", output))
+			return ThrowError(env, "Failed to set return value");
 	}
-#endif
-	SET_OBJ(ret, "col", Integer::New(ISOLATE col));
-	RETURN_VAL( ret );
+
+	return ret;
 }
 
-#ifndef YENC_NO_EXTERNAL_BUFFER
-FUNC(Decode) {
-	FUNC_START;
-	
-	if (args.Length() == 0 || !node::Buffer::HasInstance(args[0]))
-		RETURN_ERROR("You must supply a Buffer");
-	
-	size_t arg_len = node::Buffer::Length(args[0]);
-	if (arg_len == 0)
-		RETURN_VAL( NEW_BUFFER(0) );
-	
+static napi_value Decode(napi_env env, napi_callback_info info) {
+	init_all();
+
+	size_t argc = 2;
+	napi_value args[2];
+	if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok)
+		return ThrowError(env, "Failed to read arguments");
+	if (argc == 0)
+		return ThrowTypeError(env, "You must supply a Buffer");
+
+	const uint8_t* input = nullptr;
+	size_t input_len = 0;
+	if (!GetBufferInfo(env, args[0], &input, &input_len))
+		return ThrowTypeError(env, "You must supply a Buffer");
+	if (input_len == 0)
+		return CreateBuffer(env, 0, nullptr);
+
 	bool isRaw = false;
-	if (args.Length() > 1)
-		isRaw = ARG_TO_BOOL(args[1]);
-	
-	unsigned char *result = (unsigned char*) malloc(arg_len);
-	size_t len = decode(isRaw, (const unsigned char*)node::Buffer::Data(args[0]), result, arg_len, NULL);
-	result = (unsigned char*)realloc(result, len);
-	MARK_EXT_MEM(len);
-	RETURN_VAL( NEW_BUFFER((char*)result, len, free_buffer, (void*)len) );
-}
-#endif
+	if (argc > 1) {
+		if (!GetBool(env, args[1], &isRaw))
+			return ThrowTypeError(env, "stripDots must be a boolean");
+	}
 
-FUNC(DecodeTo) {
-	FUNC_START;
-	
-	if (args.Length() < 2 || !node::Buffer::HasInstance(args[0]) || !node::Buffer::HasInstance(args[1]))
-		RETURN_ERROR("You must supply two Buffers");
-	
-	size_t arg_len = node::Buffer::Length(args[0]);
-	if (arg_len == 0)
-		RETURN_VAL( Integer::New(ISOLATE 0) );
-	
-	// check that destination buffer has enough space
-	if(node::Buffer::Length(args[1]) < arg_len)
-		RETURN_VAL( Integer::New(ISOLATE 0) );
-	
+	unsigned char* result = static_cast<unsigned char*>(malloc(input_len));
+	if (!result)
+		return ThrowError(env, "Out of memory");
+	size_t len = decode(isRaw, input, result, input_len, nullptr);
+	unsigned char* shrunk = static_cast<unsigned char*>(realloc(result, len));
+	if (shrunk != nullptr)
+		result = shrunk;
+	else if (len != 0) {
+		unsigned char* exact = static_cast<unsigned char*>(malloc(len));
+		if (!exact) {
+			free(result);
+			return ThrowError(env, "Out of memory");
+		}
+		memcpy(exact, result, len);
+		free(result);
+		result = exact;
+	}
+
+	return CreateExternalBuffer(env, result, len);
+}
+
+static napi_value DecodeTo(napi_env env, napi_callback_info info) {
+	init_all();
+
+	size_t argc = 3;
+	napi_value args[3];
+	if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok)
+		return ThrowError(env, "Failed to read arguments");
+	if (argc < 2)
+		return ThrowTypeError(env, "You must supply two Buffers");
+
+	const uint8_t* input = nullptr;
+	unsigned char* output = nullptr;
+	size_t input_len = 0;
+	size_t output_len = 0;
+	if (!GetBufferInfo(env, args[0], &input, &input_len) || !GetMutableBufferInfo(env, args[1], &output, &output_len))
+		return ThrowTypeError(env, "You must supply two Buffers");
+	if (input_len == 0 || output_len < input_len) {
+		napi_value zero;
+		if (!CreateNumber(env, 0, &zero))
+			return ThrowError(env, "Failed to create return value");
+		return zero;
+	}
+
 	bool isRaw = false;
-	if (args.Length() > 2)
-		isRaw = ARG_TO_BOOL(args[2]);
-	
-	size_t len = decode(isRaw, (const unsigned char*)node::Buffer::Data(args[0]), (unsigned char*)node::Buffer::Data(args[1]), arg_len, NULL);
-	RETURN_VAL( Integer::New(ISOLATE len) );
+	if (argc > 2) {
+		if (!GetBool(env, args[2], &isRaw))
+			return ThrowTypeError(env, "stripDots must be a boolean");
+	}
+
+	size_t len = decode(isRaw, input, output, input_len, nullptr);
+	napi_value result;
+	if (!CreateNumber(env, static_cast<double>(len), &result))
+		return ThrowError(env, "Failed to create return value");
+	return result;
 }
 
+static napi_value DecodeIncr(napi_env env, napi_callback_info info) {
+	init_all();
 
-FUNC(DecodeIncr) {
-	FUNC_START;
-	
-	if (args.Length() == 0 || !node::Buffer::HasInstance(args[0]))
-		RETURN_ERROR("You must supply a Buffer");
-	
-	size_t arg_len = node::Buffer::Length(args[0]);
-	if (arg_len == 0)
-		// handled properly in Javascript
-		RETURN_UNDEF;
-	
+	size_t argc = 3;
+	napi_value args[3];
+	if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok)
+		return ThrowError(env, "Failed to read arguments");
+	if (argc == 0)
+		return ThrowTypeError(env, "You must supply a Buffer");
+
+	const uint8_t* input = nullptr;
+	size_t input_len = 0;
+	if (!GetBufferInfo(env, args[0], &input, &input_len))
+		return ThrowTypeError(env, "You must supply a Buffer");
+	if (input_len == 0)
+		return Undefined(env);
+
 	YencDecoderState state = YDEC_STATE_CRLF;
-	unsigned char *result = NULL;
-	bool allocResult = true;
-	if (args.Length() > 1) {
-		state = (YencDecoderState)(ARG_TO_INT(args[1]));
-		if (args.Length() > 2 && node::Buffer::HasInstance(args[2])) {
-			if(node::Buffer::Length(args[2]) < arg_len)
-				RETURN_ERROR("Destination buffer does not have enough space");
-			result = (unsigned char*)node::Buffer::Data(args[2]);
-			allocResult = false;
+	unsigned char* result = nullptr;
+	bool alloc_result = true;
+	if (argc > 1) {
+		int32_t parsed = 0;
+		if (!GetInt32(env, args[1], &parsed))
+			return ThrowTypeError(env, "state must be a number");
+		state = static_cast<YencDecoderState>(parsed);
+		if (argc > 2) {
+			bool is_buffer = false;
+			if (napi_is_buffer(env, args[2], &is_buffer) == napi_ok && is_buffer) {
+				size_t output_len = 0;
+				if (!GetMutableBufferInfo(env, args[2], &result, &output_len))
+					return ThrowError(env, "Failed to read destination buffer");
+				if (output_len < input_len)
+					return ThrowError(env, "Destination buffer does not have enough space");
+				alloc_result = false;
+			}
 		}
 	}
-	
-#ifdef YENC_NO_EXTERNAL_BUFFER
-	if(allocResult) RETURN_ERROR("Destination buffer must be supplied as buffer allocation isn't enabled in this build");
-#endif
-	
-	const unsigned char* src = (const unsigned char*)node::Buffer::Data(args[0]);
+
+	const unsigned char* src = input;
 	const unsigned char* sp = src;
-#ifdef DBG_ALIGN_SOURCE
-	void* newSrc = valloc(arg_len);
-	memcpy(newSrc, src, arg_len);
-	sp = (const unsigned char*)newSrc;
-#endif
-	
-#ifndef YENC_NO_EXTERNAL_BUFFER
-	if(allocResult) result = (unsigned char*) malloc(arg_len);
-#endif
+	if (alloc_result) {
+		result = static_cast<unsigned char*>(malloc(input_len));
+		if (!result)
+			return ThrowError(env, "Out of memory");
+	}
 	unsigned char* dp = result;
-	YencDecoderEnd ended = RapidYenc::decode_end((const void**)&sp, (void**)&dp, arg_len, &state);
-	size_t len = dp - result;
-#ifndef YENC_NO_EXTERNAL_BUFFER
-	if(allocResult) result = (unsigned char*)realloc(result, len);
-#endif
-	
-#ifdef DBG_ALIGN_SOURCE
-	free(newSrc);
-#endif
-	
-	Local<Object> ret = NEW_OBJECT;
-	SET_OBJ(ret, "read", Integer::New(ISOLATE sp - src));
-	SET_OBJ(ret, "written", Integer::New(ISOLATE len));
-#ifndef YENC_NO_EXTERNAL_BUFFER
-	if(allocResult) {
-		SET_OBJ(ret, "output", NEW_BUFFER((char*)result, len, free_buffer, (void*)len));
-		MARK_EXT_MEM(len);
+	YencDecoderEnd ended = RapidYenc::decode_end(reinterpret_cast<const void**>(&sp), reinterpret_cast<void**>(&dp), input_len, &state);
+	size_t len = static_cast<size_t>(dp - result);
+
+	napi_value ret;
+	if (napi_create_object(env, &ret) != napi_ok)
+		return ThrowError(env, "Failed to create return value");
+
+	napi_value read_value;
+	napi_value written_value;
+	napi_value ended_value;
+	napi_value state_value;
+	if (!CreateNumber(env, static_cast<double>(sp - src), &read_value)
+		|| !CreateNumber(env, static_cast<double>(len), &written_value)
+		|| !CreateInt32(env, static_cast<int32_t>(ended), &ended_value)
+		|| !CreateInt32(env, static_cast<int32_t>(state), &state_value))
+		return ThrowError(env, "Failed to create return value");
+	if (!SetNamedProperty(env, ret, "read", read_value)
+		|| !SetNamedProperty(env, ret, "written", written_value)
+		|| !SetNamedProperty(env, ret, "ended", ended_value)
+		|| !SetNamedProperty(env, ret, "state", state_value))
+		return ThrowError(env, "Failed to set return value");
+
+	if (alloc_result) {
+		unsigned char* shrunk = static_cast<unsigned char*>(realloc(result, len));
+		if (shrunk != nullptr)
+			result = shrunk;
+		else if (len != 0) {
+			unsigned char* exact = static_cast<unsigned char*>(malloc(len));
+			if (!exact) {
+				free(result);
+				return ThrowError(env, "Out of memory");
+			}
+			memcpy(exact, result, len);
+			free(result);
+			result = exact;
+		}
+		napi_value output = CreateExternalBuffer(env, result, len);
+		if (output == nullptr)
+			return nullptr;
+		if (!SetNamedProperty(env, ret, "output", output))
+			return ThrowError(env, "Failed to set return value");
 	}
-#endif
-	SET_OBJ(ret, "ended", Integer::New(ISOLATE (int)ended));
-	SET_OBJ(ret, "state", Integer::New(ISOLATE state));
-	RETURN_VAL( ret );
+
+	return ret;
 }
 
-
-static inline uint32_t read_crc32(const Local<Value>& buf) {
-	const uint8_t* arr = (const uint8_t*)node::Buffer::Data(buf);
-	return (((uint_fast32_t)arr[0] << 24) | ((uint_fast32_t)arr[1] << 16) | ((uint_fast32_t)arr[2] << 8) | (uint_fast32_t)arr[3]);
-}
-static inline Local<Object> pack_crc32(
-#if NODE_VERSION_AT_LEAST(0, 11, 0)
-	Isolate* isolate,
-#endif
-uint32_t crc) {
-	Local<Object> buff = NEW_BUFFER(4);
-	unsigned char* d = (unsigned char*)node::Buffer::Data(buff);
-	d[0] = (unsigned char)(crc >> 24) & 0xFF;
-	d[1] = (unsigned char)(crc >> 16) & 0xFF;
-	d[2] = (unsigned char)(crc >>  8) & 0xFF;
-	d[3] = (unsigned char)crc & 0xFF;
-	return buff;
-}
-
-// crc32(str, init)
-FUNC(CRC32) {
-	FUNC_START;
-	
-	if (args.Length() == 0 || !node::Buffer::HasInstance(args[0]))
-		RETURN_ERROR("You must supply a Buffer");
-	// TODO: support string args??
-	
-	uint32_t crc = 0;
-	if (args.Length() >= 2) {
-		if (!node::Buffer::HasInstance(args[1]) || node::Buffer::Length(args[1]) != 4)
-			RETURN_ERROR("Second argument must be a 4 byte buffer");
-		crc = read_crc32(args[1]);
-	}
-	crc = crc32(
-		(const void*)node::Buffer::Data(args[0]),
-		node::Buffer::Length(args[0]),
-		crc
-	);
-	RETURN_VAL(pack_crc32(ISOLATE crc));
-}
-
-FUNC(CRC32Combine) {
-	FUNC_START;
-	
-	if (args.Length() < 3)
-		RETURN_ERROR("At least 3 arguments required");
-	if (!node::Buffer::HasInstance(args[0]) || node::Buffer::Length(args[0]) != 4
-	|| !node::Buffer::HasInstance(args[1]) || node::Buffer::Length(args[1]) != 4)
-		RETURN_ERROR("You must supply a 4 byte Buffer for the first two arguments");
-	
-	uint32_t crc1 = read_crc32(args[0]), crc2 = read_crc32(args[1]);
-	size_t len = (size_t)ARG_TO_INT(args[2]);
-	
-	crc1 = crc32_combine(crc1, crc2, len);
-	RETURN_VAL(pack_crc32(ISOLATE crc1));
-}
-
-FUNC(CRC32Zeroes) {
-	FUNC_START;
-	
-	if (args.Length() < 1)
-		RETURN_ERROR("At least 1 argument required");
-	
-	uint32_t crc1 = 0;
-	if (args.Length() >= 2) {
-		if (!node::Buffer::HasInstance(args[1]) || node::Buffer::Length(args[1]) != 4)
-			RETURN_ERROR("Second argument must be a 4 byte buffer");
-		crc1 = read_crc32(args[1]);
-	}
-	int len = ARG_TO_INT(args[0]);
-	if(len < 0)
-		crc1 = crc32_unzero(crc1, -len);
-	else
-		crc1 = crc32_zeros(crc1, len);
-	RETURN_VAL(pack_crc32(ISOLATE crc1));
-}
-
-FUNC(CRC32Multiply) {
-	FUNC_START;
-	
-	if (args.Length() < 2)
-		RETURN_ERROR("At least 2 arguments required");
-	
-	if (!node::Buffer::HasInstance(args[0]) || node::Buffer::Length(args[0]) != 4
-	|| !node::Buffer::HasInstance(args[1]) || node::Buffer::Length(args[1]) != 4)
-		RETURN_ERROR("You must supply a 4 byte Buffer for the first two arguments");
-	
-	uint32_t crc1 = read_crc32(args[0]);
-	uint32_t crc2 = read_crc32(args[1]);
-	crc1 = crc32_multiply(crc1, crc2);
-	RETURN_VAL(pack_crc32(ISOLATE crc1));
-}
-
-FUNC(CRC32Shift) {
-	FUNC_START;
-	
-	if (args.Length() < 1)
-		RETURN_ERROR("At least 1 argument required");
-	
-	uint32_t crc1 = 0x80000000;
-	if (args.Length() >= 2) {
-		if (!node::Buffer::HasInstance(args[1]) || node::Buffer::Length(args[1]) != 4)
-			RETURN_ERROR("Second argument must be a 4 byte buffer");
-		crc1 = read_crc32(args[1]);
-	}
-	int n = ARG_TO_INT(args[0]);
-	if(n < 0)
-		crc1 = crc32_shift(crc1, ~crc32_powmod(-n));
-	else
-		crc1 = crc32_shift(crc1, crc32_powmod(n));
-	RETURN_VAL(pack_crc32(ISOLATE crc1));
-}
-
-
-static void init_all() {
-	encoder_init();
-	decoder_init();
-	crc32_init();	
-}
-
-#if NODE_VERSION_AT_LEAST(10, 7, 0)
-// signal context aware module for node if it supports it
-# include <uv.h>
-static uv_once_t init_once = UV_ONCE_INIT;
-NODE_MODULE_INIT(/* exports, module, context */)
-#else
-void yencode_init(
-# if NODE_VERSION_AT_LEAST(4, 0, 0)
- Local<Object> exports,
- Local<Value> module,
- void* priv
-# else
- Handle<Object> exports
-# endif
-)
-#endif
-{
-#ifndef YENC_NO_EXTERNAL_BUFFER
-	NODE_SET_METHOD(exports, "encode", Encode);
-	NODE_SET_METHOD(exports, "decode", Decode);
-#endif
-	NODE_SET_METHOD(exports, "encodeTo", EncodeTo);
-	NODE_SET_METHOD(exports, "encodeIncr", EncodeIncr);
-	NODE_SET_METHOD(exports, "decodeTo", DecodeTo);
-	NODE_SET_METHOD(exports, "decodeIncr", DecodeIncr);
-	NODE_SET_METHOD(exports, "crc32", CRC32);
-	NODE_SET_METHOD(exports, "crc32_combine", CRC32Combine);
-	NODE_SET_METHOD(exports, "crc32_zeroes", CRC32Zeroes);
-	NODE_SET_METHOD(exports, "crc32_multiply", CRC32Multiply);
-	NODE_SET_METHOD(exports, "crc32_shift", CRC32Shift);
-	
-#if NODE_VERSION_AT_LEAST(10, 7, 0)
-	uv_once(&init_once, init_all);
-#else
+static napi_value CRC32(napi_env env, napi_callback_info info) {
 	init_all();
-#endif
+
+	size_t argc = 2;
+	napi_value args[2];
+	if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok)
+		return ThrowError(env, "Failed to read arguments");
+	if (argc == 0)
+		return ThrowTypeError(env, "You must supply a Buffer");
+
+	const uint8_t* input = nullptr;
+	size_t input_len = 0;
+	if (!GetBufferInfo(env, args[0], &input, &input_len))
+		return ThrowTypeError(env, "You must supply a Buffer");
+
+	uint32_t crc = 0;
+	if (argc >= 2) {
+		const uint8_t* initial = nullptr;
+		size_t initial_len = 0;
+		if (!GetBufferInfo(env, args[1], &initial, &initial_len) || initial_len != 4)
+			return ThrowTypeError(env, "Second argument must be a 4 byte buffer");
+		crc = ReadCrc32(initial);
+	}
+	crc = RapidYenc::crc32(input, input_len, crc);
+	return PackCrc32(env, crc);
 }
 
-#if !NODE_VERSION_AT_LEAST(10, 7, 0)
-NODE_MODULE(yencode, yencode_init);
-#endif
+static napi_value CRC32Combine(napi_env env, napi_callback_info info) {
+	init_all();
+
+	size_t argc = 3;
+	napi_value args[3];
+	if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok)
+		return ThrowError(env, "Failed to read arguments");
+	if (argc < 3)
+		return ThrowTypeError(env, "At least 3 arguments required");
+
+	const uint8_t* crc1_buf = nullptr;
+	const uint8_t* crc2_buf = nullptr;
+	size_t crc1_len = 0;
+	size_t crc2_len = 0;
+	if (!GetBufferInfo(env, args[0], &crc1_buf, &crc1_len) || !GetBufferInfo(env, args[1], &crc2_buf, &crc2_len)
+		|| crc1_len != 4 || crc2_len != 4)
+		return ThrowTypeError(env, "You must supply a 4 byte Buffer for the first two arguments");
+
+	int32_t len32 = 0;
+	if (!GetInt32(env, args[2], &len32))
+		return ThrowTypeError(env, "Length must be a number");
+
+	uint32_t crc1 = ReadCrc32(crc1_buf);
+	uint32_t crc2 = ReadCrc32(crc2_buf);
+	crc1 = crc32_combine(crc1, crc2, static_cast<uint64_t>(len32));
+	return PackCrc32(env, crc1);
+}
+
+static napi_value CRC32Zeroes(napi_env env, napi_callback_info info) {
+	init_all();
+
+	size_t argc = 2;
+	napi_value args[2];
+	if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok)
+		return ThrowError(env, "Failed to read arguments");
+	if (argc < 1)
+		return ThrowTypeError(env, "At least 1 argument required");
+
+	int32_t len = 0;
+	if (!GetInt32(env, args[0], &len))
+		return ThrowTypeError(env, "Length must be a number");
+
+	uint32_t crc1 = 0;
+	if (argc >= 2) {
+		const uint8_t* initial = nullptr;
+		size_t initial_len = 0;
+		if (!GetBufferInfo(env, args[1], &initial, &initial_len) || initial_len != 4)
+			return ThrowTypeError(env, "Second argument must be a 4 byte buffer");
+		crc1 = ReadCrc32(initial);
+	}
+	if (len < 0)
+		crc1 = crc32_unzero(crc1, static_cast<uint64_t>(-len));
+	else
+		crc1 = crc32_zeros(crc1, static_cast<uint64_t>(len));
+	return PackCrc32(env, crc1);
+}
+
+static napi_value CRC32Multiply(napi_env env, napi_callback_info info) {
+	init_all();
+
+	size_t argc = 2;
+	napi_value args[2];
+	if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok)
+		return ThrowError(env, "Failed to read arguments");
+	if (argc < 2)
+		return ThrowTypeError(env, "At least 2 arguments required");
+
+	const uint8_t* crc1_buf = nullptr;
+	const uint8_t* crc2_buf = nullptr;
+	size_t crc1_len = 0;
+	size_t crc2_len = 0;
+	if (!GetBufferInfo(env, args[0], &crc1_buf, &crc1_len) || !GetBufferInfo(env, args[1], &crc2_buf, &crc2_len)
+		|| crc1_len != 4 || crc2_len != 4)
+		return ThrowTypeError(env, "You must supply a 4 byte Buffer for the first two arguments");
+
+	uint32_t crc1 = ReadCrc32(crc1_buf);
+	uint32_t crc2 = ReadCrc32(crc2_buf);
+	crc1 = crc32_multiply(crc1, crc2);
+	return PackCrc32(env, crc1);
+}
+
+static napi_value CRC32Shift(napi_env env, napi_callback_info info) {
+	init_all();
+
+	size_t argc = 2;
+	napi_value args[2];
+	if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok)
+		return ThrowError(env, "Failed to read arguments");
+	if (argc < 1)
+		return ThrowTypeError(env, "At least 1 argument required");
+
+	int32_t n = 0;
+	if (!GetInt32(env, args[0], &n))
+		return ThrowTypeError(env, "Length must be a number");
+
+	uint32_t crc1 = 0x80000000;
+	if (argc >= 2) {
+		const uint8_t* initial = nullptr;
+		size_t initial_len = 0;
+		if (!GetBufferInfo(env, args[1], &initial, &initial_len) || initial_len != 4)
+			return ThrowTypeError(env, "Second argument must be a 4 byte buffer");
+		crc1 = ReadCrc32(initial);
+	}
+	if (n < 0)
+		crc1 = crc32_shift(crc1, ~crc32_powmod(static_cast<uint64_t>(-n)));
+	else
+		crc1 = crc32_shift(crc1, crc32_powmod(static_cast<uint64_t>(n)));
+	return PackCrc32(env, crc1);
+}
+
+NAPI_MODULE_INIT() {
+	init_all();
+	static napi_property_descriptor descriptors[] = {
+		{"encode", nullptr, Encode, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"decode", nullptr, Decode, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"encodeTo", nullptr, EncodeTo, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"encodeIncr", nullptr, EncodeIncr, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"decodeTo", nullptr, DecodeTo, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"decodeIncr", nullptr, DecodeIncr, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"crc32", nullptr, CRC32, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"crc32_combine", nullptr, CRC32Combine, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"crc32_zeroes", nullptr, CRC32Zeroes, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"crc32_multiply", nullptr, CRC32Multiply, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"crc32_shift", nullptr, CRC32Shift, nullptr, nullptr, nullptr, napi_default, nullptr},
+	};
+	if (napi_define_properties(env, exports, sizeof(descriptors) / sizeof(descriptors[0]), descriptors) != napi_ok)
+		return nullptr;
+	return exports;
+}
