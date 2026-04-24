@@ -1,6 +1,6 @@
 {
   "name": "@thaunknown/yencode",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "type": "module",
   "packageManager": "pnpm@10.28.1",
   "description": "SIMD accelerated yEnc encoder/decoder and CRC32 calculator",

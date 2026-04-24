@@ -33,6 +33,9 @@ static void free_buffer(napi_env, void* data, void*) {
 	free(data);
 }
 
+static bool g_external_buffers_supported = true;
+static std::once_flag g_external_buffers_probe_once;
+
 static void init_all() {
 	static std::once_flag init_flag;
 	std::call_once(init_flag, []() {
@@ -117,11 +120,43 @@ static napi_value CreateBuffer(napi_env env, size_t length, unsigned char** data
 
 static napi_value CreateExternalBuffer(napi_env env, unsigned char* data, size_t length) {
 	napi_value buffer;
-	if (napi_create_external_buffer(env, length, data, free_buffer, nullptr, &buffer) != napi_ok) {
-		free(data);
-		return ThrowError(env, "Failed to create external buffer");
+	if (g_external_buffers_supported) {
+		napi_status status = napi_create_external_buffer(env, length, data, free_buffer, nullptr, &buffer);
+		if (status == napi_ok)
+			return buffer;
+		g_external_buffers_supported = false;
 	}
+
+	// Some runtimes (e.g. V8 Memory Cage / sandbox pointers) disallow external buffers.
+	// Fall back to an internal buffer copy while preserving API shape.
+	void* copied = nullptr;
+	napi_status status = napi_create_buffer(env, length, &copied, &buffer);
+	if (status != napi_ok) {
+		free(data);
+		return ThrowError(env, "Failed to create output buffer");
+	}
+	if (length > 0)
+		memcpy(copied, data, length);
+	free(data);
 	return buffer;
+}
+
+static bool SupportsExternalBuffers(napi_env env) {
+	std::call_once(g_external_buffers_probe_once, [&]() {
+		unsigned char* test = static_cast<unsigned char*>(malloc(1));
+		if (!test) {
+			g_external_buffers_supported = false;
+			return;
+		}
+		test[0] = 0;
+		napi_value probe;
+		napi_status status = napi_create_external_buffer(env, 1, test, free_buffer, nullptr, &probe);
+		if (status != napi_ok) {
+			free(test);
+			g_external_buffers_supported = false;
+		}
+	});
+	return g_external_buffers_supported;
 }
 
 static napi_value PackCrc32(napi_env env, uint32_t crc) {
@@ -328,6 +363,8 @@ static napi_value EncodeIncr(napi_env env, napi_callback_info info) {
 
 	size_t dest_len = YENC_MAX_SIZE(input_len, static_cast<size_t>(line_size));
 	if (alloc_result) {
+		if (!SupportsExternalBuffers(env))
+			return ThrowError(env, "Destination buffer must be supplied as buffer allocation isn't enabled in this build");
 		result = static_cast<unsigned char*>(malloc(dest_len));
 		if (!result)
 			return ThrowError(env, "Out of memory");
@@ -488,6 +525,8 @@ static napi_value DecodeIncr(napi_env env, napi_callback_info info) {
 	const unsigned char* src = input;
 	const unsigned char* sp = src;
 	if (alloc_result) {
+		if (!SupportsExternalBuffers(env))
+			return ThrowError(env, "Destination buffer must be supplied as buffer allocation isn't enabled in this build");
 		result = static_cast<unsigned char*>(malloc(input_len));
 		if (!result)
 			return ThrowError(env, "Out of memory");
@@ -678,7 +717,8 @@ static napi_value CRC32Shift(napi_env env, napi_callback_info info) {
 
 NAPI_MODULE_INIT() {
 	init_all();
-	static napi_property_descriptor descriptors[] = {
+	const bool supports_external_buffers = SupportsExternalBuffers(env);
+	static napi_property_descriptor descriptors_with_external[] = {
 		{"encode", nullptr, Encode, nullptr, nullptr, nullptr, napi_default, nullptr},
 		{"decode", nullptr, Decode, nullptr, nullptr, nullptr, napi_default, nullptr},
 		{"encodeTo", nullptr, EncodeTo, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -691,7 +731,23 @@ NAPI_MODULE_INIT() {
 		{"crc32_multiply", nullptr, CRC32Multiply, nullptr, nullptr, nullptr, napi_default, nullptr},
 		{"crc32_shift", nullptr, CRC32Shift, nullptr, nullptr, nullptr, napi_default, nullptr},
 	};
-	if (napi_define_properties(env, exports, sizeof(descriptors) / sizeof(descriptors[0]), descriptors) != napi_ok)
+	static napi_property_descriptor descriptors_without_external[] = {
+		{"encodeTo", nullptr, EncodeTo, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"encodeIncr", nullptr, EncodeIncr, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"decodeTo", nullptr, DecodeTo, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"decodeIncr", nullptr, DecodeIncr, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"crc32", nullptr, CRC32, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"crc32_combine", nullptr, CRC32Combine, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"crc32_zeroes", nullptr, CRC32Zeroes, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"crc32_multiply", nullptr, CRC32Multiply, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"crc32_shift", nullptr, CRC32Shift, nullptr, nullptr, nullptr, napi_default, nullptr},
+	};
+
+	const napi_property_descriptor* descriptors = supports_external_buffers ? descriptors_with_external : descriptors_without_external;
+	size_t descriptor_count = supports_external_buffers
+		? (sizeof(descriptors_with_external) / sizeof(descriptors_with_external[0]))
+		: (sizeof(descriptors_without_external) / sizeof(descriptors_without_external[0]));
+	if (napi_define_properties(env, exports, descriptor_count, descriptors) != napi_ok)
 		return nullptr;
 	return exports;
 }
