@@ -35,7 +35,7 @@
     "prebuild-musl": "prebuildify --napi --strip --libc=musl --tag-libc",
     "prebuild-ia32": "prebuildify --napi --strip --arch=ia32"
   },
-  "gypfile": true,
+  "addon": true,
   "bugs": {
     "url": "https://github.com/thaunknown/node-yencode/issues"
   },
@@ -44,6 +44,8 @@
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
+    "cmake-napi": "^1.2.2",
+    "cmake-npm": "^1.1.1",
     "eslint-config-standard-universal": "^1.0.9",
     "prebuildify": "^6.0.1"
   }
