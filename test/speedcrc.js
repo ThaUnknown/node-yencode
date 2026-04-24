@@ -1,20 +1,23 @@
-var y = require('../build/Release/yencode');
-var _ = require('./_speedbase');
+import { createRequire } from 'node:module'
 
+import { parseArgs, sleep, bufAvg, rounds, run } from './_speedbase'
 
-_.parseArgs('Syntax: node test/speedcrc [{-s|--sleep}=msecs(0)]');
+const require = createRequire(import.meta.url)
+const y = require('../build/Release/yencode')
+
+parseArgs('Syntax: node test/speedcrc [{-s|--sleep}=msecs(0)]')
 
 // warmup
-if(!_.sleep) {
-	_.bufAvg.forEach(function(buf, i) {
-		var p=process.hrtime();
-		for(var i=0;i<_.rounds;i+=2) y.crc32(buf);
-		var t=process.hrtime(p);
-	});
+if (!sleep) {
+  bufAvg.forEach(function (buf, i) {
+    const p = process.hrtime()
+    for (var i = 0; i < rounds; i += 2) y.crc32(buf)
+    const t = process.hrtime(p)
+  })
 }
 
-setTimeout(function() {
-	_.bufAvg.forEach(function(buf, i) {
-		_.run('Random ('+i+')', y.crc32.bind(null, buf));
-	});
-}, _.sleep);
+setTimeout(function () {
+  bufAvg.forEach(function (buf, i) {
+    run('Random (' + i + ')', y.crc32.bind(null, buf))
+  })
+}, sleep)

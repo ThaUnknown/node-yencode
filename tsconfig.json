@@ -7,7 +7,8 @@
     "outDir": "./"
   },
   "include": [
-    "index.ts"
+    "index.ts",
+    "test/*.js"
   ],
   "exclude": [
     "y.cjs"
