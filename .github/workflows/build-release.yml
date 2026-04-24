@@ -8,7 +8,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-20.04]
+        os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     name: Build
     steps:
@@ -25,17 +25,19 @@ jobs:
         with:
           node-version: 22.19.0
           cache: 'pnpm'
-      - run: sudo apt install -y musl musl-tools
-        if: ${{ matrix.os == 'ubuntu-20.04' }}
+      # - run: sudo apt install -y musl musl-tools
+      #   if: ${{ matrix.os == 'ubuntu-latest' }}
       - run: pnpm install --frozen-lockfile
       - run: npm run prebuild
-      - run: npm run prebuild-ia32
-        if: ${{ matrix.os == 'windows-latest' }}
-      - run: npm run prebuild-musl
-        if: ${{ matrix.os == 'ubuntu-20.04' }}
-        env:
-          CC: musl-gcc
-          CXX: musl-gcc
+      - run: npm run prebuild -- --arch=x64
+        if: ${{ matrix.os == 'macos-latest' }}
+      - run: npm run prebuild -- --arch=arm64
+        if: ${{ matrix.os == 'macos-latest' }}
+      # - run: npm run prebuild-musl
+      #   if: ${{ matrix.os == 'ubuntu-latest' }}
+      #   env:
+      #     CC: musl-gcc
+      #     CXX: musl-gcc
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.os }}
@@ -69,8 +71,8 @@ jobs:
       - name: Compress builds
         run: |
           tar --create --verbose --file="./${{ steps.get_version.outputs.VERSION }}-windows-all.tar" --directory "prebuilds/windows-latest" .
-          tar --create --verbose --file="./${{ steps.get_version.outputs.VERSION }}-linux-x86.tar" --directory "prebuilds/ubuntu-20.04" .
-          tar --create --verbose --file="./${{ steps.get_version.outputs.VERSION }}-osx-x86.tar" --directory "prebuilds/macos-latest" .
+          tar --create --verbose --file="./${{ steps.get_version.outputs.VERSION }}-linux-x86.tar" --directory "prebuilds/ubuntu-latest" .
+          tar --create --verbose --file="./${{ steps.get_version.outputs.VERSION }}-osx-all.tar" --directory "prebuilds/macos-latest" .
       - name: Upload x86 build
         uses: actions/upload-release-asset@v1
         env:
@@ -95,6 +97,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./${{ steps.get_version.outputs.VERSION }}-osx-x86.tar
-          asset_name: ${{ steps.get_version.outputs.VERSION }}-osx-x86.tar
+          asset_path: ./${{ steps.get_version.outputs.VERSION }}-osx-all.tar
+          asset_name: ${{ steps.get_version.outputs.VERSION }}-osx-all.tar
           asset_content_type: application/x-tar

@@ -32,6 +32,7 @@
     "compile": "tsc --noCheck",
     "install": "node-gyp-build",
     "prebuild": "prebuildify --napi --strip",
+    "prebuild-musl": "prebuildify --napi --strip --libc=musl --tag-libc",
     "prebuild-ia32": "prebuildify --napi --strip --arch=ia32"
   },
   "gypfile": true,
