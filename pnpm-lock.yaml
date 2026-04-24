@@ -15,6 +15,12 @@ importers:
       '@types/node':
         specifier: ^25.6.0
         version: 25.6.0
+      cmake-napi:
+        specifier: ^1.2.2
+        version: 1.2.2
+      cmake-npm:
+        specifier: ^1.1.1
+        version: 1.1.1
       eslint-config-standard-universal:
         specifier: ^1.0.9
         version: 1.0.9(@typescript-eslint/parser@8.59.0(eslint@9.39.4)(typescript@5.9.3))
@@ -284,6 +290,12 @@ packages:
 
   chownr@1.1.4:
     resolution: {integrity: sha512-jJ0bqzaylmJtVnNgzTeSOs8DPavpbYgEr/b0YL8/2GO3xJEhInFmhKMUnEJQjZumK7KXGFhUy89PrsJWlakBVg==}
+
+  cmake-napi@1.2.2:
+    resolution: {integrity: sha512-xPhSCy8GnqXAc8JsEqNYygGTDrErFgg1vT8CosfOxZ5dQ9yZsZJSVbIjl3k7v8ghzs710vksW1RsyvbRaqakkw==}
+
+  cmake-npm@1.1.1:
+    resolution: {integrity: sha512-kXz1vY9uyFXcKIzapkJ8+mEU2biH9aO8IKr9slnVO/PQpswPlp91YtkYTJUcc8CW/grE2p/8uH/qhgoMOf4Vug==}
 
   code-red@1.0.4:
     resolution: {integrity: sha512-7qJWqItLA8/VPVlKJlFXU+NBlo/qyfs39aJcuMT/2ere32ZqvF5OSxgdM5xOfJJ7O429gg2HM47y8v9P+9wrNw==}
@@ -1561,6 +1573,10 @@ snapshots:
       supports-color: 7.2.0
 
   chownr@1.1.4: {}
+
+  cmake-napi@1.2.2: {}
+
+  cmake-npm@1.1.1: {}
 
   code-red@1.0.4:
     dependencies:
